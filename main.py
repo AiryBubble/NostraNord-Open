@@ -177,6 +177,7 @@ SHORTLINK_DOMAINS = frozenset({
     "transparentlink.co",
     "v.gd",
     "wp.me",
+    "x.gd",
 })
 
 @bot.event
