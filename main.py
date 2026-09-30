@@ -179,6 +179,7 @@ SHORTLINK_DOMAINS = frozenset({
     "wp.me",
     "x.gd",
     "kuku.lu",
+    "ozeu.link",
 })
 
 @bot.event
