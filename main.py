@@ -180,6 +180,7 @@ SHORTLINK_DOMAINS = frozenset({
     "x.gd",
     "kuku.lu",
     "ozeu.link",
+    "rinu.jp",
 })
 
 @bot.event
