@@ -7,7 +7,7 @@ import random
 import asyncio
 from collections import defaultdict
 from datetime import datetime, timedelta
-import better_profanity
+from safetext import SafeText
 from dotenv import load_dotenv
 from url_checker import check_url_with_filter, download_filter_list
 import toml
@@ -143,8 +143,10 @@ def save_verify_config():
     except Exception as e:
         print(f"認証設定保存エラー: {e}")
 
-from better_profanity import profanity
-profanity.load_censor_words()
+profanity_filters = (
+    SafeText(language='ja'),
+    SafeText(language='en'),
+)
 
 EMBED_COLOR_SUCCESS = discord.Color.green()
 EMBED_COLOR_ERROR = discord.Color.red()
@@ -1231,7 +1233,7 @@ async def handle_violation(message, reason):
 
 def check_profanity(message):
 
-    if profanity.contains_profanity(message.content):
+    if any(filter_.check_profanity(message.content) for filter_ in profanity_filters):
         return "不適切な言葉が検出されました"
     return None
     
