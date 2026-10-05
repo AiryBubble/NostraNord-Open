@@ -26,6 +26,7 @@ bot = commands.Bot(command_prefix='!', intents=intents)
 WHITELIST_FILE = 'invite_whitelist.toml'
 BANLOG_FILE = 'ban_log.toml'
 VERIFY_CONFIG_FILE = 'verify_config.toml'
+PROFANITY_DISABLED_FILE = 'profanity_disabled.toml'
 
 invite_whitelist_channels = defaultdict(set)
 user_message_counts = defaultdict(list)
@@ -40,6 +41,7 @@ violation_tracker = defaultdict(lambda: defaultdict(lambda: {
 }))
 
 verify_configs = {}
+profanity_disabled_guilds = set()
 verify_cooldowns = defaultdict(float)
 
 VERIFY_COOLDOWN_SECONDS = 30
@@ -143,6 +145,26 @@ def save_verify_config():
     except Exception as e:
         print(f"認証設定保存エラー: {e}")
 
+def load_profanity_settings():
+
+    global profanity_disabled_guilds
+    try:
+        if os.path.exists(PROFANITY_DISABLED_FILE):
+            with open(PROFANITY_DISABLED_FILE, 'r', encoding='utf-8') as f:
+                data = toml.load(f)
+                profanity_disabled_guilds = {int(guild_id) for guild_id in data.get('disabled_guilds', [])}
+    except Exception as e:
+        print(f"不適切語フィルター設定読み込みエラー: {e}")
+
+def save_profanity_settings():
+
+    try:
+        data = {'disabled_guilds': sorted(profanity_disabled_guilds)}
+        with open(PROFANITY_DISABLED_FILE, 'w', encoding='utf-8') as f:
+            toml.dump(data, f)
+    except Exception as e:
+        print(f"不適切語フィルター設定保存エラー: {e}")
+
 profanity_filters = (
     SafeText(language='ja'),
     SafeText(language='en'),
@@ -159,31 +181,23 @@ def build_embed(description: str, *, title: str = None, color: discord.Color = E
         embed.title = title
     return embed
 
-SHORTLINK_DOMAINS = frozenset({
-    "b.link",
-    "bit.ly",
-    "buff.ly",
-    "cutt.ly",
-    "dub.sh",
-    "ift.tt",
-    "is.gd",
-    "rb.gy",
-    "rebrand.ly",
-    "s.gy",
-    "shorturl.at",
-    "t.co",
-    "t.ly",
-    "tiny.cc",
-    "tiny.one",
-    "tinyurl.com",
-    "transparentlink.co",
-    "v.gd",
-    "wp.me",
-    "x.gd",
-    "kuku.lu",
-    "ozeu.link",
-    "rinu.jp",
-})
+SHORTLINK_DOMAINS_FILE = 'shortlink_domains.txt'
+SHORTLINK_DOMAINS = frozenset()
+
+def load_shortlink_domains():
+
+    global SHORTLINK_DOMAINS
+    try:
+        with open(SHORTLINK_DOMAINS_FILE, 'r', encoding='utf-8') as f:
+            SHORTLINK_DOMAINS = frozenset(
+                line.split('#', 1)[0].strip().lower().rstrip('.')
+                for line in f
+                if line.split('#', 1)[0].strip()
+            )
+        print(f"短縮リンクドメインを {len(SHORTLINK_DOMAINS)} 件読み込みました")
+    except OSError as e:
+        SHORTLINK_DOMAINS = frozenset()
+        print(f"短縮リンクドメインリスト読み込みエラー: {e}")
 
 @bot.event
 async def on_ready():
@@ -192,6 +206,8 @@ async def on_ready():
     load_whitelist()
     load_banlog()
     load_verify_config()
+    load_profanity_settings()
+    load_shortlink_domains()
     download_filter_list()
 
     bot.add_view(VerifyPanelView())
@@ -510,6 +526,35 @@ async def slash_whitelist_list(interaction: discord.Interaction):
         embed = build_embed('許可チャンネルは設定されていません', title='📋 招待リンク許可チャンネル', color=EMBED_COLOR_INFO)
         await interaction.followup.send(embed=embed, ephemeral=True)
 
+profanity_group = app_commands.Group(
+    name='profanity',
+    description='不適切語フィルターの有効・無効を管理します',
+    default_permissions=discord.Permissions(administrator=True),
+)
+bot.tree.add_command(profanity_group)
+
+@profanity_group.command(name='disable', description='このサーバーの不適切語フィルターを無効にします')
+@app_commands.checks.has_permissions(administrator=True)
+@app_commands.checks.cooldown(COMMAND_COOLDOWN_USES, COMMAND_COOLDOWN_SECONDS, key=lambda i: (i.guild_id, i.user.id))
+async def slash_profanity_disable(interaction: discord.Interaction):
+
+    await interaction.response.defer(ephemeral=True)
+    profanity_disabled_guilds.add(interaction.guild.id)
+    await asyncio.to_thread(save_profanity_settings)
+    embed = build_embed('このサーバーの不適切語フィルターを無効にしました', title='✅ 完了', color=EMBED_COLOR_SUCCESS)
+    await interaction.followup.send(embed=embed, ephemeral=True)
+
+@profanity_group.command(name='enable', description='このサーバーの不適切語フィルターを有効にします')
+@app_commands.checks.has_permissions(administrator=True)
+@app_commands.checks.cooldown(COMMAND_COOLDOWN_USES, COMMAND_COOLDOWN_SECONDS, key=lambda i: (i.guild_id, i.user.id))
+async def slash_profanity_enable(interaction: discord.Interaction):
+
+    await interaction.response.defer(ephemeral=True)
+    profanity_disabled_guilds.discard(interaction.guild.id)
+    await asyncio.to_thread(save_profanity_settings)
+    embed = build_embed('このサーバーの不適切語フィルターを有効にしました', title='✅ 完了', color=EMBED_COLOR_SUCCESS)
+    await interaction.followup.send(embed=embed, ephemeral=True)
+
 violation_group = app_commands.Group(
     name='violation',
     description='ユーザーの違反履歴（BAN累積カウント）の確認・管理',
@@ -669,6 +714,7 @@ async def slash_uninstall(interaction: discord.Interaction):
             '**本当にこのサーバーからBotをアンインストールしますか？**\n\n'
             '以下のデータが完全に削除されます：\n'
             '• 招待リンク許可チャンネル設定\n'
+            '• 不適切語フィルター設定\n'
             '• 全ユーザーの違反履歴\n'
             '• その他のサーバー設定\n\n'
             'この操作は**元に戻せません**。'
@@ -713,6 +759,10 @@ async def slash_uninstall(interaction: discord.Interaction):
         if str(guild_id) in verify_configs:
             del verify_configs[str(guild_id)]
             await asyncio.to_thread(save_verify_config)
+
+        if guild_id in profanity_disabled_guilds:
+            profanity_disabled_guilds.remove(guild_id)
+            await asyncio.to_thread(save_profanity_settings)
 
         for key in list(verify_cooldowns.keys()):
             if key[0] == guild_id:
@@ -1130,7 +1180,7 @@ async def on_message(message):
     reason = (
         check_token_send(message)
         or check_invite_links(message)
-        or check_shortlinks(urls)
+        or check_shortlinks(message, urls)
         or check_profanity(message)
         or check_spam(message)
         or check_flood(message)
@@ -1233,6 +1283,9 @@ async def handle_violation(message, reason):
 
 def check_profanity(message):
 
+    if message.guild.id in profanity_disabled_guilds:
+        return None
+
     if any(filter_.check_profanity(message.content) for filter_ in profanity_filters):
         return "不適切な言葉が検出されました"
     return None
@@ -1293,7 +1346,14 @@ def check_invite_links(message):
     
     return None
 
-def check_shortlinks(urls):
+def is_invite_whitelisted_channel(message):
+
+    return message.channel.id in invite_whitelist_channels.get(message.guild.id, set())
+
+def check_shortlinks(message, urls):
+
+    if is_invite_whitelisted_channel(message):
+        return None
 
     for url in urls:
         domain = url.lower()
@@ -1420,6 +1480,10 @@ def check_spoiler_spam(message):
     return None
 
 def check_markdown_spam(message):
+
+    if is_invite_whitelisted_channel(message):
+        return None
+
     markdown_patterns = [
         r'#{1,6}\s',
         r'\*\*[^*\n]+\*\*',
