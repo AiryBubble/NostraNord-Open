@@ -1,15 +1,18 @@
 import discord
-from discord.ext import commands, tasks
+import aiohttp
+from discord.ext import tasks
 from discord import app_commands
 import os
 import re
 import random
 import asyncio
+import copy
 from collections import defaultdict
 from datetime import datetime, timedelta
+from threading import Lock
 from safetext import SafeText
 from dotenv import load_dotenv
-from url_checker import check_url_with_filter, download_filter_list
+from url_checker import check_url_with_filter, download_filter_list, ensure_filter_updated
 import toml
 
 load_dotenv()
@@ -21,7 +24,39 @@ intents.message_content = True
 intents.guilds = True
 intents.members = True
 
-bot = commands.Bot(command_prefix='!', intents=intents)
+class RequestRateLimiter:
+    def __init__(self, requests_per_second: int):
+        self.interval = 1 / requests_per_second
+        self._next_request = 0.0
+        self._lock = None
+
+    async def acquire(self):
+        if self._lock is None:
+            self._lock = asyncio.Lock()
+
+        async with self._lock:
+            loop = asyncio.get_running_loop()
+            delay = self._next_request - loop.time()
+            if delay > 0:
+                await asyncio.sleep(delay)
+            self._next_request = loop.time() + self.interval
+
+discord_api_rate_limiter = RequestRateLimiter(requests_per_second=40)
+malware_filter_refresh_lock = asyncio.Lock()
+malware_check_semaphore = asyncio.Semaphore(8)
+
+async def limit_discord_api_requests(session, trace_config_ctx, params):
+    await discord_api_rate_limiter.acquire()
+
+discord_http_trace = aiohttp.TraceConfig()
+discord_http_trace.on_request_start.append(limit_discord_api_requests)
+
+class NostraNordClient(discord.Client):
+    def __init__(self):
+        super().__init__(intents=intents, http_trace=discord_http_trace)
+        self.tree = app_commands.CommandTree(self)
+
+bot = NostraNordClient()
 
 WHITELIST_FILE = 'invite_whitelist.toml'
 MODLOG_FILE = 'mod_log.toml'
@@ -61,6 +96,8 @@ raid_mode_guilds = {}
 
 COMMAND_COOLDOWN_USES = 3
 COMMAND_COOLDOWN_SECONDS = 10
+modlog_write_lock = Lock()
+modlog_async_lock = asyncio.Lock()
 
 def load_modlog():
 
@@ -92,29 +129,44 @@ def load_modlog():
     if loaded_legacy_file or discarded_banned_entries:
         save_modlog()
 
-def save_modlog():
+def _create_modlog_snapshot():
 
-    try:
-        data = {}
-        for guild_id, users in violation_tracker.items():
-            data[str(guild_id)] = {}
-            for user_id, info in users.items():
-                entry = {
-                    'status': info.get('status', 'active'),
-                    'count': info['count'],
-                    'violations': info.get('violations', []),
-                }
-                if info.get('last_violation') is not None:
-                    entry['last_violation'] = info['last_violation']
-                if info.get('banned_at') is not None:
-                    entry['banned_at'] = info['banned_at']
-                if info.get('ban_reason') is not None:
-                    entry['ban_reason'] = info['ban_reason']
-                data[str(guild_id)][str(user_id)] = entry
+    data = {}
+    for guild_id, users in violation_tracker.items():
+        data[str(guild_id)] = {}
+        for user_id, info in users.items():
+            entry = {
+                'status': info.get('status', 'active'),
+                'count': info['count'],
+                'violations': copy.deepcopy(info.get('violations', [])),
+            }
+            if info.get('last_violation') is not None:
+                entry['last_violation'] = info['last_violation']
+            if info.get('banned_at') is not None:
+                entry['banned_at'] = info['banned_at']
+            if info.get('ban_reason') is not None:
+                entry['ban_reason'] = info['ban_reason']
+            data[str(guild_id)][str(user_id)] = entry
+    return data
+
+def _write_modlog_snapshot(data):
+
+    with modlog_write_lock:
         with open(MODLOG_FILE, 'w', encoding='utf-8') as f:
             toml.dump(data, f)
+
+def save_modlog(snapshot=None):
+
+    try:
+        _write_modlog_snapshot(snapshot if snapshot is not None else _create_modlog_snapshot())
     except Exception as e:
         print(f"モデレーションログ保存エラー: {e}")
+
+async def persist_modlog():
+
+    async with modlog_async_lock:
+        snapshot = _create_modlog_snapshot()
+        await asyncio.to_thread(save_modlog, snapshot)
 
 def load_whitelist():
 
@@ -219,7 +271,8 @@ async def on_ready():
     load_verify_config()
     load_profanity_settings()
     load_shortlink_domains()
-    download_filter_list()
+    async with malware_filter_refresh_lock:
+        await asyncio.to_thread(download_filter_list)
 
     bot.add_view(VerifyPanelView())
 
@@ -655,7 +708,7 @@ async def slash_violation_reset(interaction: discord.Interaction, user: discord.
     guild_id = interaction.guild.id
     if guild_id in violation_tracker and user.id in violation_tracker[guild_id]:
         del violation_tracker[guild_id][user.id]
-        await asyncio.to_thread(save_modlog)
+        await persist_modlog()
         embed = build_embed(f'{user.mention} の違反カウントをリセットしました', title='✅ 完了', color=EMBED_COLOR_SUCCESS)
         await interaction.followup.send(embed=embed, ephemeral=True)
     else:
@@ -686,7 +739,7 @@ async def slash_unban(interaction: discord.Interaction, user_id: str):
 
         if interaction.guild.id in violation_tracker and target_id in violation_tracker[interaction.guild.id]:
             del violation_tracker[interaction.guild.id][target_id]
-            await asyncio.to_thread(save_modlog)
+            await persist_modlog()
 
         embed = build_embed(f'ユーザーID `{user_id}` のBANを解除し、残っている違反履歴も削除しました', title='✅ 完了', color=EMBED_COLOR_SUCCESS)
         await interaction.followup.send(embed=embed, ephemeral=True)
@@ -797,7 +850,7 @@ async def slash_uninstall(interaction: discord.Interaction):
 
         if guild_id in violation_tracker:
             del violation_tracker[guild_id]
-            await asyncio.to_thread(save_modlog)
+            await persist_modlog()
 
         if str(guild_id) in verify_configs:
             del verify_configs[str(guild_id)]
@@ -1243,8 +1296,6 @@ async def on_message(message):
             await handle_violation(message, reason)
         return
 
-    await bot.process_commands(message)
-
 BAN_THRESHOLD = 3
 VIOLATION_RESET_TIME = 3600
 BAN_MESSAGE_DELETE_DAYS = 1
@@ -1279,7 +1330,7 @@ async def handle_violation(message, reason):
                 delete_message_seconds=BAN_MESSAGE_DELETE_DAYS * 86400
             )
         except discord.Forbidden:
-            await asyncio.to_thread(save_modlog)
+            await persist_modlog()
             failed_embed = build_embed(
                 f'{message.author.mention} がBAN条件を満たしましたが、権限不足でBANできませんでした',
                 title='❌ エラー',
@@ -1292,7 +1343,7 @@ async def handle_violation(message, reason):
         violation_tracker[guild_id].pop(user_id, None)
         if not violation_tracker[guild_id]:
             violation_tracker.pop(guild_id, None)
-        await asyncio.to_thread(save_modlog)
+        await persist_modlog()
 
         ban_embed = build_embed(
             f'{message.author.mention} がBANされました\n'
@@ -1306,7 +1357,7 @@ async def handle_violation(message, reason):
             pass
         return "banned"
     else:
-        await asyncio.to_thread(save_modlog)
+        await persist_modlog()
         try:
             timeout_duration = min(5 * violation_count, 30)
             await message.author.timeout(
@@ -1416,14 +1467,24 @@ def check_shortlinks(message, urls):
 
 async def check_malware_links(urls):
 
-    for url in urls:
+    if not urls:
+        return None
 
-        check_url = url
-        if not check_url.startswith(('http://', 'https://')):
-            check_url = 'http://' + check_url
+    async with malware_filter_refresh_lock:
+        filter_available = await asyncio.to_thread(ensure_filter_updated)
+    if not filter_available:
+        return None
 
-        if await asyncio.to_thread(check_url_with_filter, check_url):
-            return "マルウェアリンクが検出されました"
+    async def check_one_url(url):
+        normalized_url = url
+        if not normalized_url.startswith(('http://', 'https://')):
+            normalized_url = 'http://' + normalized_url
+
+        async with malware_check_semaphore:
+            return await asyncio.to_thread(check_url_with_filter, normalized_url, refresh_cache=False)
+
+    if any(await asyncio.gather(*(check_one_url(url) for url in urls))):
+        return "マルウェアリンクが検出されました"
     return None
 
 def check_spam(message):

@@ -115,9 +115,9 @@ def _domain_matches(domain):
     return False
 
 
-def check_url_with_filter(url):
+def check_url_with_filter(url, *, refresh_cache=True):
     try:
-        if not ensure_filter_updated():
+        if refresh_cache and not ensure_filter_updated():
             return False
 
         domain = extract_domain_from_url(url)
