@@ -24,7 +24,8 @@ intents.members = True
 bot = commands.Bot(command_prefix='!', intents=intents)
 
 WHITELIST_FILE = 'invite_whitelist.toml'
-BANLOG_FILE = 'ban_log.toml'
+MODLOG_FILE = 'mod_log.toml'
+LEGACY_BANLOG_FILE = 'ban_log.toml'
 VERIFY_CONFIG_FILE = 'verify_config.toml'
 PROFANITY_DISABLED_FILE = 'profanity_disabled.toml'
 
@@ -61,15 +62,21 @@ raid_mode_guilds = {}
 COMMAND_COOLDOWN_USES = 3
 COMMAND_COOLDOWN_SECONDS = 10
 
-def load_banlog():
+def load_modlog():
 
     global violation_tracker
+    source_file = MODLOG_FILE if os.path.exists(MODLOG_FILE) else LEGACY_BANLOG_FILE
+    loaded_legacy_file = False
+    discarded_banned_entries = False
     try:
-        if os.path.exists(BANLOG_FILE):
-            with open(BANLOG_FILE, 'r', encoding='utf-8') as f:
+        if os.path.exists(source_file):
+            with open(source_file, 'r', encoding='utf-8') as f:
                 data = toml.load(f)
                 for guild_id, users in data.items():
                     for user_id, info in users.items():
+                        if info.get('status') == 'banned':
+                            discarded_banned_entries = True
+                            continue
                         violation_tracker[int(guild_id)][int(user_id)] = {
                             'status': info.get('status', 'active'),
                             'count': info.get('count', 0),
@@ -78,10 +85,14 @@ def load_banlog():
                             'banned_at': info.get('banned_at'),
                             'ban_reason': info.get('ban_reason'),
                         }
+            loaded_legacy_file = source_file == LEGACY_BANLOG_FILE
     except Exception as e:
-        print(f"BAN履歴読み込みエラー: {e}")
+        print(f"モデレーションログ読み込みエラー: {e}")
 
-def save_banlog():
+    if loaded_legacy_file or discarded_banned_entries:
+        save_modlog()
+
+def save_modlog():
 
     try:
         data = {}
@@ -100,10 +111,10 @@ def save_banlog():
                 if info.get('ban_reason') is not None:
                     entry['ban_reason'] = info['ban_reason']
                 data[str(guild_id)][str(user_id)] = entry
-        with open(BANLOG_FILE, 'w', encoding='utf-8') as f:
+        with open(MODLOG_FILE, 'w', encoding='utf-8') as f:
             toml.dump(data, f)
     except Exception as e:
-        print(f"BAN履歴保存エラー: {e}")
+        print(f"モデレーションログ保存エラー: {e}")
 
 def load_whitelist():
 
@@ -204,7 +215,7 @@ async def on_ready():
     print(f'{bot.user} としてログインしました')
 
     load_whitelist()
-    load_banlog()
+    load_modlog()
     load_verify_config()
     load_profanity_settings()
     load_shortlink_domains()
@@ -348,9 +359,51 @@ async def on_guild_join(guild):
         await bot.tree.sync(guild=guild)
     except Exception as e:
         print(f"スラッシュコマンドの同期に失敗: {e}")
+
+    await send_install_guide(guild)
     
     await disable_external_apps_permissions(guild)
     await setup_token_automod_rule(guild)
+
+async def send_install_guide(guild):
+
+    bot_member = guild.me
+    if bot_member is None:
+        return
+
+    guide = (
+        'botnameを導入いただきありがとうございます！\n\n'
+        '**最初にBotのロールを設定してください**\n'
+        'サーバー設定の「ロール」を開き、botnameのロールをロール一覧の一番上に移動してください。'
+        'ロールを管理・タイムアウト・BANする機能を使う場合、Botのロールを対象ロールより上に置き、'
+        'Botに必要な権限を付与してください。\n'
+        '管理者向けコマンドはスラッシュコマンドから設定できます。'
+    )
+
+    system_channel = guild.system_channel
+    if system_channel is not None:
+        permissions = system_channel.permissions_for(bot_member)
+        if permissions.view_channel and permissions.send_messages:
+            try:
+                await system_channel.send(guide)
+                return
+            except (discord.Forbidden, discord.HTTPException):
+                pass
+
+    preferred_channel_names = ('general', 'welcome')
+    channels = sorted(
+        guild.text_channels,
+        key=lambda channel: not any(name in channel.name.lower() for name in preferred_channel_names),
+    )
+    for channel in channels:
+        permissions = channel.permissions_for(bot_member)
+        if not (permissions.view_channel and permissions.send_messages):
+            continue
+        try:
+            await channel.send(guide)
+            return
+        except (discord.Forbidden, discord.HTTPException):
+            continue
 
 async def disable_external_apps_permissions(guild):
 
@@ -573,17 +626,7 @@ async def slash_violation_check(interaction: discord.Interaction, user: discord.
     guild_id = interaction.guild.id
     user_data = violation_tracker.get(guild_id, {}).get(user.id, None)
 
-    if user_data and user_data.get('status') == 'banned':
-        embed = discord.Embed(
-            title=f"{user.display_name} の違反履歴",
-            color=discord.Color.red()
-        )
-        embed.add_field(name="状態", value="🔨 累積違反によりBAN済み（履歴は集約済み）", inline=False)
-        embed.add_field(name="BAN時点の違反回数", value=f"{user_data['count']}/{BAN_THRESHOLD}", inline=False)
-        embed.add_field(name="BAN理由", value=user_data.get('ban_reason') or "不明", inline=False)
-        embed.add_field(name="BAN日時", value=user_data.get('banned_at') or "不明", inline=False)
-        await interaction.followup.send(embed=embed, ephemeral=True)
-    elif user_data and user_data['violations']:
+    if user_data and user_data['violations']:
         embed = discord.Embed(
             title=f"{user.display_name} の違反履歴",
             color=discord.Color.orange()
@@ -612,14 +655,14 @@ async def slash_violation_reset(interaction: discord.Interaction, user: discord.
     guild_id = interaction.guild.id
     if guild_id in violation_tracker and user.id in violation_tracker[guild_id]:
         del violation_tracker[guild_id][user.id]
-        await asyncio.to_thread(save_banlog)
+        await asyncio.to_thread(save_modlog)
         embed = build_embed(f'{user.mention} の違反カウントをリセットしました', title='✅ 完了', color=EMBED_COLOR_SUCCESS)
         await interaction.followup.send(embed=embed, ephemeral=True)
     else:
         embed = build_embed(f'{user.mention} の違反履歴はありません', title='📋 違反履歴', color=EMBED_COLOR_INFO)
         await interaction.followup.send(embed=embed, ephemeral=True)
 
-@bot.tree.command(name='unban', description='指定ユーザーIDのBANを解除し、蓄積した違反履歴もリセットします')
+@bot.tree.command(name='unban', description='指定ユーザーIDのBANを解除し、残っている違反履歴も削除します')
 @app_commands.default_permissions(administrator=True)
 @app_commands.checks.has_permissions(administrator=True)
 @app_commands.checks.cooldown(COMMAND_COOLDOWN_USES, COMMAND_COOLDOWN_SECONDS, key=lambda i: (i.guild_id, i.user.id))
@@ -643,9 +686,9 @@ async def slash_unban(interaction: discord.Interaction, user_id: str):
 
         if interaction.guild.id in violation_tracker and target_id in violation_tracker[interaction.guild.id]:
             del violation_tracker[interaction.guild.id][target_id]
-            await asyncio.to_thread(save_banlog)
+            await asyncio.to_thread(save_modlog)
 
-        embed = build_embed(f'ユーザーID `{user_id}` のBANを解除し、違反履歴もリセットしました', title='✅ 完了', color=EMBED_COLOR_SUCCESS)
+        embed = build_embed(f'ユーザーID `{user_id}` のBANを解除し、残っている違反履歴も削除しました', title='✅ 完了', color=EMBED_COLOR_SUCCESS)
         await interaction.followup.send(embed=embed, ephemeral=True)
 
     except ValueError:
@@ -754,7 +797,7 @@ async def slash_uninstall(interaction: discord.Interaction):
 
         if guild_id in violation_tracker:
             del violation_tracker[guild_id]
-            await asyncio.to_thread(save_banlog)
+            await asyncio.to_thread(save_modlog)
 
         if str(guild_id) in verify_configs:
             del verify_configs[str(guild_id)]
@@ -1227,8 +1270,6 @@ async def handle_violation(message, reason):
         'channel': message.channel.id,
         'time': current_time
     })
-    await asyncio.to_thread(save_banlog)
-    
     violation_count = user_data['count']
     
     if violation_count >= BAN_THRESHOLD:
@@ -1237,24 +1278,8 @@ async def handle_violation(message, reason):
                 reason=f"累積違反 {violation_count} 回: {reason}",
                 delete_message_seconds=BAN_MESSAGE_DELETE_DAYS * 86400
             )
-            ban_embed = build_embed(
-                f'{message.author.mention} がBANされました\n'
-                f'理由: 累積違反 {violation_count} 回 - {reason}',
-                title='🔨 BAN',
-                color=EMBED_COLOR_ERROR
-            )
-            await message.channel.send(embed=ban_embed, delete_after=30)
-            violation_tracker[guild_id][user_id] = {
-                'status': 'banned',
-                'count': violation_count,
-                'last_violation': current_time,
-                'violations': [],
-                'banned_at': current_time,
-                'ban_reason': reason,
-            }
-            await asyncio.to_thread(save_banlog)
-            return "banned"
         except discord.Forbidden:
+            await asyncio.to_thread(save_modlog)
             failed_embed = build_embed(
                 f'{message.author.mention} がBAN条件を満たしましたが、権限不足でBANできませんでした',
                 title='❌ エラー',
@@ -1262,7 +1287,26 @@ async def handle_violation(message, reason):
             )
             await message.channel.send(embed=failed_embed, delete_after=10)
             return "failed"
+
+        # Discard this user's accumulated history after the server ban.
+        violation_tracker[guild_id].pop(user_id, None)
+        if not violation_tracker[guild_id]:
+            violation_tracker.pop(guild_id, None)
+        await asyncio.to_thread(save_modlog)
+
+        ban_embed = build_embed(
+            f'{message.author.mention} がBANされました\n'
+            f'理由: 累積違反 {violation_count} 回 - {reason}',
+            title='🔨 BAN',
+            color=EMBED_COLOR_ERROR
+        )
+        try:
+            await message.channel.send(embed=ban_embed, delete_after=30)
+        except discord.HTTPException:
+            pass
+        return "banned"
     else:
+        await asyncio.to_thread(save_modlog)
         try:
             timeout_duration = min(5 * violation_count, 30)
             await message.author.timeout(
