@@ -823,7 +823,7 @@ async def slash_raid_status(interaction: discord.Interaction):
         embed = build_embed(
             f'レイド対策モード: 有効\n'
             f'あと約 {int(remaining // 60)} 分{int(remaining % 60)} 秒で自動解除されます。\n'
-            f'`/raid disable` で手動解除もできます。',
+            f'`/antiraid disable` で手動解除もできます。',
             title='🛡️ レイド対策モードの状態',
             color=EMBED_COLOR_WARNING
         )
