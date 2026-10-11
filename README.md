@@ -15,3 +15,5 @@
 - [Phishing URL Blocklist](https://gitlab.com/malware-filter/phishing-filter)
 # 注記
 safetextの依存関係でPythonのバージョンは3.12.xがいいかと思われます。
+
+Fluxer版は[ここから](https://github.com/AiryBubble/NostraNord-Fluxer)
