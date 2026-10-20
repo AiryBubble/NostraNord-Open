@@ -424,13 +424,14 @@ async def send_install_guide(guild):
     if bot_member is None:
         return
 
-    guide = (
-        'botnameを導入いただきありがとうございます！\n\n'
+    guide = build_embed(
         '**最初にBotのロールを設定してください**\n'
         'サーバー設定の「ロール」を開き、botnameのロールをロール一覧の一番上に移動してください。'
         'ロールを管理・タイムアウト・BANする機能を使う場合、Botのロールを対象ロールより上に置き、'
         'Botに必要な権限を付与してください。\n'
-        '管理者向けコマンドはスラッシュコマンドから設定できます。'
+        '管理者向けコマンドはスラッシュコマンドから設定できます。',
+        title='botnameを導入いただきありがとうございます！',
+        color=EMBED_COLOR_INFO,
     )
 
     system_channel = guild.system_channel
@@ -438,7 +439,7 @@ async def send_install_guide(guild):
         permissions = system_channel.permissions_for(bot_member)
         if permissions.view_channel and permissions.send_messages:
             try:
-                await system_channel.send(guide)
+                await system_channel.send(embed=guide)
                 return
             except (discord.Forbidden, discord.HTTPException):
                 pass
@@ -453,7 +454,7 @@ async def send_install_guide(guild):
         if not (permissions.view_channel and permissions.send_messages):
             continue
         try:
-            await channel.send(guide)
+            await channel.send(embed=guide)
             return
         except (discord.Forbidden, discord.HTTPException):
             continue
@@ -1555,25 +1556,41 @@ async def cleanup_spam_tracking():
             del recent_joins[guild_id]
 
 def check_emoji_spam(message):
-    custom_emoji = len(re.findall(r'<a?:[a-zA-Z0-9_]+:[0-9]+>', message.content))
-    unicode_emoji = len(re.findall(
-      r'[\U0001F600-\U0001F64F'
-      r'\U0001F300-\U0001F5FF'
-      r'\U0001F680-\U0001F6FF'
-      r'\U0001F1E0-\U0001F1FF'
-      r'\u2600-\u27BF'
-      r'\u2700-\u27BF'
-      r'\uFE00-\uFEFF]',
-    message.content
-))
-    
-    total_emoji = custom_emoji + unicode_emoji
-    words = message.content.split()
-    
+
+    content = message.content
+    custom_emoji_pattern = r'<a?:[a-zA-Z0-9_]+:[0-9]+>'
+    unicode_emoji_pattern = re.compile(
+        r'[\U0001F600-\U0001F64F'
+        r'\U0001F300-\U0001F5FF'
+        r'\U0001F680-\U0001F6FF'
+        r'\U0001F1E0-\U0001F1FF'
+        r'\u2600-\u27BF'
+        r'\u2700-\u27BF]'
+        r'[\uFE0E\uFE0F]?'
+        r'(?:\u200D[\U0001F300-\U0001FAFF][\uFE0E\uFE0F]?)*'
+        r'(?:\U0001F3FB-\U0001F3FF)?'
+    )
+
+    custom_matches = list(re.finditer(custom_emoji_pattern, content))
+    unicode_matches = list(unicode_emoji_pattern.finditer(content))
+    emoji_spans = sorted(
+        [(match.start(), match.end()) for match in custom_matches + unicode_matches]
+    )
+
+    # Merge overlapping spans so variation selectors and combined emoji count once.
+    covered_chars = 0
+    span_end = -1
+    for start, end in emoji_spans:
+        if end > span_end:
+            covered_chars += end - max(start, span_end)
+            span_end = end
+
+    total_emoji = len(custom_matches) + len(unicode_matches)
     if total_emoji <= 5:
         return None
-    
-    if total_emoji / max(len(words), 1) >= 0.8:
+
+    non_whitespace_chars = sum(not char.isspace() for char in content)
+    if non_whitespace_chars and covered_chars / non_whitespace_chars >= 0.8:
         return "絵文字スパムが検出されました"
     return None
 
